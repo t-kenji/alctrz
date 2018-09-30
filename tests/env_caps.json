@@ -1,0 +1,30 @@
+{
+    "filesystem": {
+        "devtmpfs": false,
+        "procfs": true,
+        "sysfs": true
+    },
+    "directory": [
+        "/bin",
+        "/etc",
+        "/mnt",
+        "/var"
+    ],
+    "bind": [
+        "/bin",
+        "/sbin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/tmp",
+        "/home/tkenji/Workspace/Workbench/git",
+        "/lib/x86_64-linux-gnu",
+        "/lib64/ld-linux-x86-64.so.2",
+        "/usr/lib/x86_64-linux-gnu"
+    ],
+    "stdio": "fifo:///tmp/stdio.%d",
+    "keep_capability": [
+        "CAP_SYS_ADMIN",
+        "CAP_SYS_MODULE",
+        "CAP_NET_ADMIN"
+    ]
+}
