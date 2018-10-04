@@ -26,10 +26,10 @@
 #include <errno.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
+#include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
-//#include <sys/xattr.h>
 #include <sys/epoll.h>
 #include <linux/capability.h>
 #include <linux/securebits.h>
@@ -65,7 +65,7 @@ struct alctrz {
      */
     struct prisoner {
         /**
-         *  実行ユーザ / グループ情報.
+         *  実行ユーザ / グループの情報.
          */
         struct user {
             gid_t gid;                 /**< グループ ID. */
@@ -77,6 +77,9 @@ struct alctrz {
         char term[PATH_MAX];       /**< ターミナル名. */
         char shell_path[PATH_MAX]; /**< シェルのパス. */
 
+        /**
+         *  標準入出力の情報.
+         */
         struct stdio {
             char path[PATH_MAX];
         } stdio;
@@ -86,15 +89,18 @@ struct alctrz {
         pid_t pid;          /**< プロセス ID. */
     } prisoner;
 
+    /**
+     *  jail の情報.
+     */
     struct jail {
         json_t *env;                /**< jail の rootfs 構成情報. */
         char mount_point[PATH_MAX]; /**< jail を作成するパス. */
     } jail;
 
-    bool show_help;
-    bool show_version;
+    bool show_help;    /**< ヘルプを表示する. */
+    bool show_version; /**< バージョンを表示する. */
 
-    LIST bind_entries;          /**< バインド登録情報. */
+    LIST bind_entries; /**< バインド登録情報. */
 };
 
 /**
@@ -131,23 +137,24 @@ struct alctrz {
  */
 #define lengthof(array) (sizeof(array)/sizeof(array[0]))
 
-static FILE *logger = NULL;
+/**
+ *  小さい方を返す.
+ */
+#define min(a, b) (((a) > (b)) ? (b) : (a))
 
-#define logger_debug(format, ...)                             \
-    do {                                                      \
-        if (logger == NULL) {                                 \
-            static char path[PATH_MAX];                       \
-            snprintf(path, sizeof(path), "/tmp/alctrz.%d.log", getpid()); \
-            logger = fopen(path, "w");           \
-        }                                                     \
-        fprintf(logger, "%s:%d:%s$ " format "\n",             \
-                __FILE__, __LINE__, __func__, ##__VA_ARGS__); \
-        fflush(logger);                                       \
-    } while (0)
-
+/**
+ *  標準入力のターミナル情報.
+ */
 static struct termios saved_term;
+
+/**
+ *  ターミナルのウィンドウサイズ.
+ */
 static struct winsize winsz;
 
+/**
+ *  ラムダ式マクロ.
+ */
 #define lambda(ret_type, ...)        \
     __extension__                    \
     ({                               \
@@ -157,6 +164,8 @@ static struct winsize winsz;
 
 /**
  *  使用方法を表示する.
+ *
+ *  @param  [in]    name    モジュール名.
  */
 static void print_usage(const char *name)
 {
@@ -179,7 +188,36 @@ static void print_version(void)
 }
 
 /**
+ *  指定のファイル記述子に指定書式で文字列を出力する.
+ *
+ *  @param  [in]    fd      ファイル記述子.
+ *  @param  [in]    format  文字列書式.
+ *  @param  [in]    ...     書式パラメータ.
+ *  @return 成功の場合は書き込んだ文字列の長さが返り,
+ *          失敗の場合は -1 が返る.
+ */
+__attribute__((format (printf, 2, 3)))
+static int fdprintf(int fd, const char *format, ...)
+{
+    int length = -1;
+    char *buf = malloc(BUFSIZ);
+    if (buf != NULL) {
+        va_list ap;
+        va_start(ap, format);
+        length = vsnprintf(buf, BUFSIZ, format, ap);
+        va_end(ap);
+        length = write(fd, buf, min(length, BUFSIZ));
+    }
+    free(buf);
+    return length;
+}
+
+/**
  *  capability を文字列から数値に変換する.
+ *
+ *  @param  [in]    name    capability 名称.
+ *  @return 変換出来る場合は capability の数値が返り,
+ *          失敗の場合は -1 が返る.
  */
 static int capability_to_int(const char *name)
 {
@@ -236,6 +274,13 @@ static int capability_to_int(const char *name)
     return -1;
 }
 
+/**
+ *  ファイル記述子のブロッキングを設定する.
+ *
+ *  @param  [in]    fd      ファイル記述子.
+ *  @param  [in]    enabled ブロッキングするか.
+ *  @return 成功時は 0 が返り, 失敗時は -1 が返る.
+ */
 static int set_blocking(int fd, bool enabled)
 {
     int mode = fcntl(fd, F_GETFL);
@@ -256,6 +301,15 @@ static int set_blocking(int fd, bool enabled)
     return 0;
 }
 
+/**
+ *  分離してデーモン化する.
+ *
+ *  @param      [in]    on_error    エラーハンドラ.
+ *  @param      [in]    at_child    デーモンプロセスハンドラ.
+ *  @param      [in]    at_parent   監視プロセスハンドラ.
+ *  @return     成功時は 0 が返り, 失敗時は -1 が返る.
+ *  @remarks    デーモンプロセスは本関数から返ることはない.
+ */
 static int fork_daemon(void (*on_error)(void),
                        int (*at_child)(void),
                        int (*at_parent)(pid_t))
@@ -267,7 +321,7 @@ static int fork_daemon(void (*on_error)(void),
         }
         return -1;
     } else if (pid == 0) {
-#if 0
+#if 1
         int null_fd = open("/dev/null", O_RDWR);
         if ((dup2(null_fd, STDIN_FILENO) != STDIN_FILENO)
             || (dup2(null_fd, STDOUT_FILENO) != STDOUT_FILENO)
@@ -287,6 +341,14 @@ static int fork_daemon(void (*on_error)(void),
     }
 }
 
+/**
+ *  epoll 監視の監視対象に指定のファイル記述子を追加する.
+ *
+ *  @param  [in]    epfd    epoll ファイル記述子.
+ *  @param  [in]    events  監視対象のイベント.
+ *  @param  [in]    fd      監視対象のファイル記述子.
+ *  @returm 成功時は 0 が返り, 失敗時は -1 が返る.
+ */
 static int epoll_add_fd(int epfd, uint32_t events, int fd)
 {
     struct epoll_event ev;
@@ -298,20 +360,49 @@ static int epoll_add_fd(int epfd, uint32_t events, int fd)
     return 0;
 }
 
+/**
+ *  指定のファイル記述子に対するイベントを待つ.
+ *
+ *  イベント発生時は対応するイベントハンドラを呼び出す.
+ *
+ *  @param  [in]    fds         ファイル記述子配列.
+ *  @param  [in]    handlers    イベントハンドラ配列.
+ *  @param  [in]    count       配列長.
+ *  @param  [in]    events      監視対象のイベント.
+ *  @return 成功時は 0 が返り, 失敗時は -1 が返る.
+ */
 static int wait_for_event(int fds[],
-                          bool (*handlers[])(void),
+                          bool (*handlers[])(uint32_t),
                           int count,
                           uint32_t events)
 {
+    sigset_t mask, saved_mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &mask, &saved_mask);
+    int sigfd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
+    if (sigfd < 0) {
+        DEBUG("signalfd: %s", strerror(errno));
+        return -1;
+    }
+
     int epfd = epoll_create1(0);
     if (epfd < 0) {
-        perror("epoll_create1");
+        DEBUG("epoll_create1: %s", strerror(errno));
+        close(epfd);
+        return -1;
+    }
+    if (epoll_add_fd(epfd, EPOLLIN, sigfd) != 0) {
+        DEBUG("epoll_add_fd: %s", strerror(errno));
+        close(epfd);
+        close(sigfd);
         return -1;
     }
     for (int i = 0; i < count; ++i) {
         if (epoll_add_fd(epfd, events, fds[i]) != 0) {
-            perror("epoll_add_fd");
+            DEBUG("epoll_add_fd: %s", strerror(errno));
             close(epfd);
+            close(sigfd);
             return -1;
         }
     }
@@ -321,25 +412,37 @@ static int wait_for_event(int fds[],
         struct epoll_event evs[10];
         int nevs = epoll_wait(epfd, evs, lengthof(evs), -1);
         if (nevs < 0) {
-            perror("epoll_wait");
+            DEBUG("epoll_wait: %s", strerror(errno));
             be_cont = false;
         } else {
             for (int i = 0; i < nevs; ++i) {
-                if (evs[i].events & EPOLLIN) {
-                    for (int j = 0; j < count; ++j) {
-                        if (fds[j] == evs[i].data.fd) {
-                            be_cont = handlers[j]();
-                            break;
+                if (evs[i].data.fd == sigfd) {
+                    if (evs[i].events & EPOLLIN) {
+                        struct signalfd_siginfo siginfo = {0};
+                        if (read(sigfd, &siginfo, sizeof(siginfo)) > 0) {
+                            switch (siginfo.ssi_signo) {
+                            case SIGCHLD:
+                                be_cont = false;
+                                break;
+                            default:
+                                break;
+                            }
                         }
                     }
                 } else {
-                    be_cont = false;
+                    for (int j = 0; j < count; ++j) {
+                        if (fds[j] == evs[i].data.fd) {
+                            be_cont = handlers[j](evs[i].events);
+                            break;
+                        }
+                    }
                 }
             }
         }
     } while (be_cont);
 
     close(epfd);
+    close(sigfd);
 
     return 0;
 }
@@ -769,18 +872,6 @@ static int try_json_array(struct alctrz *self,
     return 0;
 }
 
-static const char *try_json_string(struct alctrz *self,
-                                   json_t *data,
-                                   const char *name)
-{
-    json_t *obj = json_object_get(data, name);
-    if (!json_is_string(obj)) {
-        DEBUG("json: %s is not a string", name);
-        return "";
-    }
-    return json_string_value(obj) ?: "";
-}
-
 static bool try_json_boolean(struct alctrz *self,
                              json_t *data,
                              const char *name)
@@ -988,7 +1079,6 @@ static int create_stdio_for_prisoner(struct alctrz *self)
     }
     *format = '\0';
     format += 3;
-    DEBUG("proto: '%s', format: '%s'", proto, format);
     if (strcmp(proto, "fifo") == 0) {
         strncpy(self->prisoner.stdio.path, format, sizeof(self->prisoner.stdio.path));
         char path[PATH_MAX];
@@ -1083,7 +1173,7 @@ static int drop_capabilities(struct alctrz *self)
             }
             ret = prctl(PR_CAPBSET_DROP, i);
             if (ret != 0) {
-                DEBUG("json: %s (%d)", strerror(errno), i);
+                DEBUG("prctl: %s (%d)", strerror(errno), i);
             }
 
             /* ついでに file capability からも落とす. */
@@ -1091,11 +1181,9 @@ static int drop_capabilities(struct alctrz *self)
         } else {
             ret = prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, i, 0, 0);
             if (ret != 0) {
-                DEBUG("json: %s (%d)", strerror(errno), i);
+                DEBUG("prctl: %s (%d)", strerror(errno), i);
             }
-            DEBUG("ambient raise: %d", i);
         }
-
         data[CAP_TO_INDEX(i)].inheritable |= CAP_TO_MASK(i);
     }
 
@@ -1107,39 +1195,6 @@ static int drop_capabilities(struct alctrz *self)
         DEBUG("prctl: %s", strerror(errno));
         return -1;
     }
-
-    char command[256];
-    snprintf(command, sizeof(command), "grep ^Cap /proc/%d/status", getpid());
-    system(command);
-#if 0
-    /* 実行プログラムに file capability を設定する. */
-    struct vfs_cap_data file_cap = {
-        .magic_etc = VFS_CAP_REVISION | VFS_CAP_FLAGS_EFFECTIVE,
-        .data = {
-            {
-                .permitted = data[0].permitted & data[0].inheritable,
-                .inheritable = 0
-            },
-            {
-                .permitted = data[1].permitted & data[1].inheritable,
-                .inheritable = 0
-            }
-        }
-    };
-    ret = setxattr(self->prisoner.argv[0], "security.capability", &file_cap, sizeof(file_cap), 0);
-    if (ret != 0) {
-        DEBUG("setxattr: %s", strerror(errno));
-        return -1;
-    }
-
-    ret = getxattr(self->prisoner.argv[0], "security.capability", &file_cap, sizeof(file_cap));
-    if (ret != sizeof(file_cap)) {
-        DEBUG("getxattr: %s", strerror(errno));
-        return -1;
-    }
-    DEBUG("inheritable: %08x %08x", file_cap.data[1].inheritable, file_cap.data[0].inheritable);
-    DEBUG("permitted: %08x %08x", file_cap.data[1].permitted, file_cap.data[0].permitted);
-#endif
 
     return 0;
 }
@@ -1320,6 +1375,8 @@ static int alctrz(struct alctrz *self)
 {
     int ret;
 
+    setsid();
+
     ret = create_jail(self);
     if (ret != 0) {
         return -1;
@@ -1332,75 +1389,82 @@ static int alctrz(struct alctrz *self)
 
     int master_fd;
     self->prisoner.pid = forkpty(&master_fd, NULL, &saved_term, &winsz);
-    if (self->prisoner.pid == 0) {
+    if (self->prisoner.pid < 0) {
+        return -1;
+    } else if (self->prisoner.pid == 0) {
         ret = chroot(self->jail.mount_point);
         if (ret != 0) {
-            logger_debug("chroot: %s", strerror(errno));
-        } else {
-            ret = reset_environment(self);
-            if (ret != 0) {
-                logger_debug("reset_environment: failed");
-                exit(2);
-            }
-            ret = chdir("/");
-            if (ret != 0) {
-                logger_debug("chdir: %s", strerror(errno));
-                exit(2);
-            }
-            recursive_mkdir(self->prisoner.home_path,
-                            DIR_PERM_DEF,
-                            self->prisoner.user.uid,
-                            self->prisoner.user.gid,
-                            false);
-
-            ret = drop_capabilities(self);
-            if (ret != 0) {
-                exit(2);
-            }
-
-            gid_t gid = self->prisoner.user.gid;
-            uid_t uid = self->prisoner.user.uid;
-            const gid_t aux_gids[] = {
-                gid,
-            };
-            ret = setgid(gid);
-            if (ret != 0) {
-                DEBUG("setgid: %s", strerror(errno));
-                exit(2);
-            }
-            ret = setgroups(lengthof(aux_gids), aux_gids);
-            if (ret != 0) {
-                DEBUG("setgroups: %s", strerror(errno));
-                exit(2);
-            }
-            ret = setuid(uid);
-            if (ret != 0) {
-                DEBUG("setuid: %s", strerror(errno));
-                exit(2);
-            }
-            ret = chdir(self->prisoner.home_path);
-            if (ret != 0) {
-                exit(2);
-            }
-            json_decref(self->jail.env);
-            execvp(self->prisoner.argv[0], self->prisoner.argv);
-            DEBUG("%s: %s", self->prisoner.argv[0], strerror(errno));
+            DEBUG("chroot: %s (%s)", strerror(errno), self->jail.mount_point);
+            exit(2);
         }
-        exit(2);
-    } else if (self->prisoner.pid > 0) {
-        set_blocking(master_fd, false);
+        ret = reset_environment(self);
+        if (ret != 0) {
+            exit(2);
+        }
+        ret = chdir("/");
+        if (ret != 0) {
+            DEBUG("chdir: %s, (/)", strerror(errno));
+            exit(2);
+        }
+        recursive_mkdir(self->prisoner.home_path,
+                        DIR_PERM_DEF,
+                        self->prisoner.user.uid,
+                        self->prisoner.user.gid,
+                        false);
 
-        char path[PATH_MAX];
+        ret = drop_capabilities(self);
+        if (ret != 0) {
+            exit(2);
+        }
+
+        gid_t gid = self->prisoner.user.gid;
+        uid_t uid = self->prisoner.user.uid;
+        const gid_t aux_gids[] = {
+            gid,
+        };
+        ret = setgid(gid);
+        if (ret != 0) {
+            DEBUG("setgid: %s", strerror(errno));
+            exit(2);
+        }
+        ret = setgroups(lengthof(aux_gids), aux_gids);
+        if (ret != 0) {
+            DEBUG("setgroups: %s", strerror(errno));
+            exit(2);
+        }
+        ret = setuid(uid);
+        if (ret != 0) {
+            DEBUG("setuid: %s", strerror(errno));
+            exit(2);
+        }
+        ret = chdir(self->prisoner.home_path);
+        if (ret != 0) {
+            DEBUG("chdir: %s (%s)", strerror(errno), self->prisoner.home_path);
+            exit(2);
+        }
+        json_decref(self->jail.env);
+        execvp(self->prisoner.argv[0], self->prisoner.argv);
+        DEBUG("%s: %s", self->prisoner.argv[0], strerror(errno));
+    }
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), self->prisoner.stdio.path, STDOUT_FILENO);
+    int stdout_fd = open(path, O_WRONLY);
+    if (stdout_fd < 0) {
+        kill(self->prisoner.pid, SIGTERM);
+        close(master_fd);
+        return -1;
+    }
+
+    set_blocking(master_fd, false);
+
+    ret = -1;
+    do {
         snprintf(path, sizeof(path), self->prisoner.stdio.path, STDIN_FILENO);
-        int stdin_fd = open(path, O_RDONLY);
+        int stdin_fd = open(path, O_RDONLY | O_NONBLOCK);
         if (stdin_fd < 0) {
-            logger_debug("open: %s", strerror(errno));
-        }
-        set_blocking(stdin_fd, false);
-        snprintf(path, sizeof(path), self->prisoner.stdio.path, STDOUT_FILENO);
-        int stdout_fd = open(path, O_WRONLY);
-        if (stdout_fd < 0) {
-            logger_debug("open: %s", strerror(errno));
+            fdprintf(stdout_fd, "open: %s (%s)\r\n", strerror(errno), path);
+            break;
         }
 
         int fds[] = {
@@ -1411,51 +1475,66 @@ static int alctrz(struct alctrz *self)
         char buf[BUFSIZ];
         ret = wait_for_event(
             fds,
-            (bool (*[])(void)){
-                lambda(bool, (void) {
-                    read_len = read(stdin_fd, buf, sizeof(buf));
-                    if (read_len < 0) {
-                        logger_debug("read: %s", strerror(errno));
-                        return false;
-                    }
-                    written_len = write(master_fd, buf, read_len);
-                    if (written_len < 0) {
-                        logger_debug("write: %s", strerror(errno));
-                        return false;
+            (bool (*[])(uint32_t)){
+                lambda(bool, (uint32_t events) {
+                    if (events & EPOLLIN) {
+                        read_len = read(stdin_fd, buf, sizeof(buf));
+                        if (read_len < 0) {
+                            fdprintf(stdout_fd, "read: %s\r\n", strerror(errno));
+                            return false;
+                        }
+                        written_len = write(master_fd, buf, read_len);
+                        if (written_len < 0) {
+                            fdprintf(stdout_fd, "write: %s\r\n", strerror(errno));
+                            return false;
+                        }
                     }
                     return true;
                 }),
-                lambda(bool, (void) {
-                    read_len = read(master_fd, buf, sizeof(buf));
-                    if (read_len < 0) {
-                        logger_debug("read: %s", strerror(errno));
-                        return false;
-                    }
-                    written_len = write(stdout_fd, buf, read_len);
-                    if (written_len < 0) {
-                        logger_debug("write: %s", strerror(errno));
-                        return false;
+                lambda(bool, (uint32_t events) {
+                    if (events & EPOLLIN) {
+                        read_len = read(master_fd, buf, sizeof(buf));
+                        if (read_len < 0) {
+                            fdprintf(stdout_fd, "read: %s\r\n", strerror(errno));
+                            return false;
+                        }
+                        written_len = write(stdout_fd, buf, read_len);
+                        if (written_len < 0) {
+                            fdprintf(stdout_fd, "write: %s\r\n", strerror(errno));
+                            return false;
+                        }
                     }
                     return true;
                 }),
             },
             lengthof(fds),
             EPOLLIN | EPOLLET);
-        kill(self->prisoner.pid, SIGTERM);
 
-        int status;
-        ret = waitpid(self->prisoner.pid, &status, 0);
-        if (ret != self->prisoner.pid) {
-            logger_debug("waitpid: %s", strerror(errno));
-        }
+        close(stdin_fd);
+    } while (0);
+
+    kill(self->prisoner.pid, SIGTERM);
+    close(master_fd);
+
+    int status;
+    ret = waitpid(self->prisoner.pid, &status, 0);
+    if (ret != self->prisoner.pid) {
+        fdprintf(stdout_fd, "waitpid: %s (%d)\r\n",
+                 strerror(errno), self->prisoner.pid);
+    } else {
         if (WIFEXITED(status)) {
-            logger_debug("child %d exited with %d", self->prisoner.pid, WEXITSTATUS(status));
+            fdprintf(stdout_fd, "child %d exited with %d\r\n",
+                     self->prisoner.pid, WEXITSTATUS(status));
         } else if (WIFSIGNALED(status)) {
-            logger_debug("child %d signaled by %d", self->prisoner.pid, WTERMSIG(status));
+            fdprintf(stdout_fd, "child %d signaled by %d\r\n",
+                     self->prisoner.pid, WTERMSIG(status));
         } else {
-            logger_debug("child %d exited with %d", self->prisoner.pid, status);
+            fdprintf(stdout_fd, "child %d exited with %#x\r\n",
+                     self->prisoner.pid, status);
         }
     }
+
+    close(stdout_fd);
 
     return 0;
 }
@@ -1465,18 +1544,18 @@ static int visitation(struct alctrz *self)
     char path[PATH_MAX];
 
     snprintf(path, sizeof(path), self->prisoner.stdio.path, STDIN_FILENO);
-    int stdin_fd = open(path, O_WRONLY);
+    int stdin_fd = open(path, O_RDWR);
     if (stdin_fd < 0) {
-        perror("open");
+        DEBUG("open: %s (%s)", strerror(errno), path);
         return -1;
     }
     snprintf(path, sizeof(path), self->prisoner.stdio.path, STDOUT_FILENO);
-    int stdout_fd = open(path, O_RDONLY);
+    int stdout_fd = open(path, O_RDONLY | O_NONBLOCK);
     if (stdout_fd < 0) {
-        perror("open");
+        DEBUG("open: %s (%s)", strerror(errno), path);
+        close(stdin_fd);
         return -1;
     }
-    set_blocking(stdout_fd, false);
 
     int fds[] = {
         STDIN_FILENO,
@@ -1486,32 +1565,44 @@ static int visitation(struct alctrz *self)
     char buf[BUFSIZ];
     int ret = wait_for_event(
         fds,
-        (bool (*[])(void)){
-            lambda(bool, (void) {
-                read_len = read(STDIN_FILENO, buf, sizeof(buf));
-                if (read_len < 0) {
-                    perror("read");
+        (bool (*[])(uint32_t)){
+            lambda(bool, (uint32_t events) {
+                if (events & EPOLLIN) {
+                    read_len = read(STDIN_FILENO, buf, sizeof(buf));
+                    if (read_len < 0) {
+                        DEBUG("read: %s", strerror(errno));
+                        return false;
+                    }
+                    if (buf[0] == 0x04) {
+                        fputs("^D (detached)\r\n", stdout);
+                        return false;
+                    }
+                    written_len = write(stdin_fd, buf, read_len);
+                    if (written_len < 0) {
+                        DEBUG("write: %s", strerror(errno));
+                        return false;
+                    }
+                    return true;
+                } else {
                     return false;
                 }
-                written_len = write(stdin_fd, buf, read_len);
-                if (written_len < 0) {
-                    perror("write");
-                    return false;
-                }
-                return true;
             }),
-            lambda(bool, (void) {
-                read_len = read(stdout_fd, buf, sizeof(buf));
-                if (read_len < 0) {
-                    perror("read");
+            lambda(bool, (uint32_t events) {
+                if (events & EPOLLIN) {
+                    read_len = read(stdout_fd, buf, sizeof(buf));
+                    if (read_len < 0) {
+                        DEBUG("read: %s", strerror(errno));
+                        return false;
+                    }
+                    written_len = write(STDOUT_FILENO, buf, read_len);
+                    if (written_len < 0) {
+                        DEBUG("write: %s", strerror(errno));
+                        return false;
+                    }
+                    return true;
+                } else {
                     return false;
                 }
-                written_len = write(STDOUT_FILENO, buf, read_len);
-                if (written_len < 0) {
-                    perror("write");
-                    return false;
-                }
-                return true;
             }),
         },
         lengthof(fds),
@@ -1593,7 +1684,7 @@ int main(int argc, char **argv)
 
     ret = fork_daemon(
         lambda(void, (void) {
-            perror("fork_daemon");
+            DEBUG("fork_daemon: %s", strerror(errno));
         }),
         lambda(int, (void) {
             int status = alctrz(self);

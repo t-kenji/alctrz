@@ -4,6 +4,7 @@
 *.o
 *.a
 *_test
+alctrz
 
 *.plist
 Doxygen.conf
