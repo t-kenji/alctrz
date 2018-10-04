@@ -97,6 +97,7 @@ struct alctrz {
         char mount_point[PATH_MAX]; /**< jail を作成するパス. */
     } jail;
 
+    bool do_attach;
     bool show_help;    /**< ヘルプを表示する. */
     bool show_version; /**< バージョンを表示する. */
 
@@ -127,6 +128,7 @@ struct alctrz {
             .env = NULL,                         \
             .mount_point = "/tmp/chroot-XXXXXX", \
         },                                       \
+        .do_attach = false,                      \
         .show_help = false,                      \
         .show_version = false,                   \
         .bind_entries = NULL,                    \
@@ -1310,7 +1312,7 @@ static int parse_arguments(struct alctrz *self, int argc, char * const *argv)
     gid_t group = (gid_t)-1;
     int ret;
 
-    while ((opt = getopt(argc, argv, "c:u:g:hv")) != -1) {
+    while ((opt = getopt(argc, argv, "c:u:g:ahv")) != -1) {
         switch (opt) {
         case 'c':
             /** @todo パスは正規化したほうが良い. (セキュアコーディング観点) */
@@ -1334,6 +1336,9 @@ static int parse_arguments(struct alctrz *self, int argc, char * const *argv)
                 return -1;
             }
             break;
+        case 'a':
+            self->do_attach = true;
+            break;
         case 'h':
             self->show_help = true;
             return 0;
@@ -1345,20 +1350,23 @@ static int parse_arguments(struct alctrz *self, int argc, char * const *argv)
             return -1;
         }
     }
-    if (argc == optind) {
-        errno = EINVAL;
-        return -1;
-    }
 
-    self->prisoner.argc = argc - optind;
-    self->prisoner.argv = &argv[optind];
-    if (self->prisoner.argv[0][0] != '/') {
-        errno = EINVAL;
-        return -1;
-    }
+    if (!self->do_attach) {
+        if (argc == optind) {
+            errno = EINVAL;
+            return -1;
+        }
 
-    if (group != (gid_t)-1) {
-        self->prisoner.user.gid = group;
+        self->prisoner.argc = argc - optind;
+        self->prisoner.argv = &argv[optind];
+        if (self->prisoner.argv[0][0] != '/') {
+            errno = EINVAL;
+            return -1;
+        }
+
+        if (group != (gid_t)-1) {
+            self->prisoner.user.gid = group;
+        }
     }
 
     return 0;
@@ -1583,9 +1591,8 @@ static int visitation(struct alctrz *self)
                         return false;
                     }
                     return true;
-                } else {
-                    return false;
                 }
+                return false;
             }),
             lambda(bool, (uint32_t events) {
                 if (events & EPOLLIN) {
@@ -1600,9 +1607,8 @@ static int visitation(struct alctrz *self)
                         return false;
                     }
                     return true;
-                } else {
-                    return false;
                 }
+                return false;
             }),
         },
         lengthof(fds),
@@ -1677,39 +1683,54 @@ int main(int argc, char **argv)
 
     ret = create_stdio_for_prisoner(self);
     if (ret != 0) {
-        return -1;
+        return 1;
     }
     tcgetattr(STDIN_FILENO, &saved_term);
     ioctl(STDIN_FILENO, TIOCGWINSZ, &winsz);
 
-    ret = fork_daemon(
-        lambda(void, (void) {
-            DEBUG("fork_daemon: %s", strerror(errno));
-        }),
-        lambda(int, (void) {
-            int status = alctrz(self);
-            cleanup(self);
-            json_decref(self->jail.env);
-            free(self);
-            return status;
-        }),
-        lambda(int, (pid_t child_pid) {
-            set_blocking(STDIN_FILENO, false);
+    if (!self->do_attach) {
+        ret = fork_daemon(
+            lambda(void, (void) {
+                DEBUG("fork_daemon: %s", strerror(errno));
+            }),
+            lambda(int, (void) {
+                int status = alctrz(self);
+                cleanup(self);
+                json_decref(self->jail.env);
+                free(self);
+                return status;
+            }),
+            lambda(int, (pid_t child_pid) {
+                set_blocking(STDIN_FILENO, false);
 
-            struct termios term = saved_term;
-            cfmakeraw(&term);
-            term.c_cc[VMIN]  = 1;
-            term.c_cc[VTIME] = 0;
-            tcsetattr(STDIN_FILENO, TCSAFLUSH, &term);
+                struct termios term = saved_term;
+                cfmakeraw(&term);
+                term.c_cc[VMIN]  = 1;
+                term.c_cc[VTIME] = 0;
+                tcsetattr(STDIN_FILENO, TCSAFLUSH, &term);
 
-            int status = visitation(self);
+                int status = visitation(self);
 
-            tcsetattr(STDIN_FILENO, TCSANOW, &saved_term);
-            set_blocking(STDIN_FILENO, true);
+                tcsetattr(STDIN_FILENO, TCSANOW, &saved_term);
+                set_blocking(STDIN_FILENO, true);
 
-            return status;
-        })
-    );
+                return status;
+            })
+        );
+    } else {
+        set_blocking(STDIN_FILENO, false);
+
+        struct termios term = saved_term;
+        cfmakeraw(&term);
+        term.c_cc[VMIN]  = 1;
+        term.c_cc[VTIME] = 0;
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &term);
+
+        ret = visitation(self);
+
+        tcsetattr(STDIN_FILENO, TCSANOW, &saved_term);
+        set_blocking(STDIN_FILENO, true);
+    }
 
     json_decref(self->jail.env);
     free(self);
