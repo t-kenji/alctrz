@@ -1,10 +1,10 @@
-Alcatraz (chroot jail) {#mainpage}
-======================
+Alcatraz (Chroot jail provider)
+===============================
 
 Introduction
 ------------
 
-Chroot jail provider.
+Alcatraz is Chroot jail provider.
 
 Dependencies
 ------------

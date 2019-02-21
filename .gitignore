@@ -2,11 +2,18 @@
 
 *.d
 *.o
-*.a
-*_test
 alctrz
+alctrz_utest
 
-*.plist
-Doxygen.conf
-/doxygen
-/cov-int
+/coverage/
+*.gcda
+*.gcno
+
+/doxygen/
+Doxyfile
+
+/cov-int/
+
+GPATH
+GTAGS
+GRTAGS

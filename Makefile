@@ -1,36 +1,57 @@
 # makefile for Alcatraz.
 
-export TOP_DIR := $(shell pwd)
+export TOP_DIR := $(PWD)
 
 include $(TOP_DIR)/config.mk
 
-.PHONY: all test test-build doc cppcheck install clean
+.PHONY: all build-all \
+        build build-test \
+        test \
+        doc \
+        cppcheck \
+        install install-config \
+        clean
 
-all:
+all: build-all
+
+build-all: build build-test
+
+build:
 	@make -C src
 
-test: test-build
+build-test: build
+	@make -C test
+
+test: build-test
+	@make -C test test
 	@sudo ./src/$(NAME) -c tests/env_caps.json -u $(USER) -- $(TOP_DIR)/tests/$(NAME)_test -r compact -s
 
-test-build: all
-	@make -C tests
-
 doc:
-	@sed -e 's/@PROJECT@/$(DOXY_PROJECT)/' \
-	     -e 's/@VERSION@/$(VERSION)/' \
-	     -e 's/@BRIEF@/$(DOXY_BRIEF)/' \
-	     -e 's/@OUTPUT@/$(DOXY_OUTPUT)/' \
-	     -e 's/@SOURCES@/$(DOXY_SOURCES)/' \
-	     Doxygen.conf.in > Doxygen.conf
-	@doxygen Doxygen.conf
+	@sed -e 's|@PROJECT@|$(DOXY_PROJECT)|' \
+	     -e 's|@VERSION@|$(DOXY_VERSION)|' \
+	     -e 's|@BRIEF@|$(DOXY_BRIEF)|' \
+	     -e 's|@OUTPUT@|$(DOXY_OUTPUT)|' \
+	     -e 's|@SOURCES@|$(DOXY_SOURCES)|' \
+	     -e 's|@EXCLUDE@|$(DOXY_EXCLUDE)|' \
+	     -e 's|@EXCLUDE_SYMBOLS@|$(DOXY_EXCLUDE_SYMBOLS)|' \
+	     -e 's|@PREDEFINED@|$(DOXY_PREDEFINED)|' \
+	     -e 's|@README@|README.md|' \
+	     -e 's|@EXTRACT_STATIC@|YES|' \
+	     -e 's|@SHOW_FILES@|YES|' \
+	     -e 's|@SOURCE_BROWSER@|YES|' \
+	     Doxyfile.in > Doxyfile
+	@doxygen Doxyfile
 
 cppcheck:
-	@cppcheck --enable=all --suppress=unusedFunction ./src
+	@make -C src cppcheck
 
-install: all
-	install -m 755 ./src/$(NAME) $(DEST:/=)/root
+install: build
+	install -m 0755 ./src/$(NAME) $(DESTDIR:/=)/root/
+
+install-config:
+	install -m 0644 conf/env.json $(DESTDIR:/=)/etc/
 
 clean:
-	@rm -rf Doxygen.conf $(DOXY_OUTPUT)
+	@rm -rf Doxyfile $(DOXY_OUTPUT) $(COV_OUTPUT)
 	@make -C src clean
-	@make -C tests clean
+	@make -C test clean
