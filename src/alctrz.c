@@ -1,8 +1,8 @@
-/** @file   alctrz.c
- *  @brief  Chroot jail 環境を提供する.
+/** @file       alctrz.c
+ *  @brief      Chroot jail 環境を提供する.
  *
- *  @author t-kenji <protect.2501@gmail.com>
- *  @date   2018-04-30 新規作成.
+ *  @author     t-kenji <protect.2501@gmail.com>
+ *  @date       2018-04-30 新規作成.
  *  @copyright  Copyright © 2018 t-kenji
  *
  *  This code is licensed under the MIT License.
@@ -301,46 +301,6 @@ static int set_blocking(int fd, bool enabled)
     }
 
     return 0;
-}
-
-/**
- *  分離してデーモン化する.
- *
- *  @param      [in]    on_error    エラーハンドラ.
- *  @param      [in]    at_child    デーモンプロセスハンドラ.
- *  @param      [in]    at_parent   監視プロセスハンドラ.
- *  @return     成功時は 0 が返り, 失敗時は -1 が返る.
- *  @remarks    デーモンプロセスは本関数から返ることはない.
- */
-static int fork_daemon(void (*on_error)(void),
-                       int (*at_child)(void),
-                       int (*at_parent)(pid_t))
-{
-    pid_t pid = fork();
-    if (pid < 0) {
-        if (on_error != NULL) {
-            on_error();
-        }
-        return -1;
-    } else if (pid == 0) {
-#if 1
-        int null_fd = open("/dev/null", O_RDWR);
-        if ((dup2(null_fd, STDIN_FILENO) != STDIN_FILENO)
-            || (dup2(null_fd, STDOUT_FILENO) != STDOUT_FILENO)
-            || (dup2(null_fd, STDERR_FILENO) != STDERR_FILENO)) {
-
-            return -1;
-        }
-        close(null_fd);
-#endif
-        exit(at_child());
-    }
-
-    if (at_parent != NULL) {
-        return at_parent(pid);
-    } else {
-        return 0;
-    }
 }
 
 /**
@@ -1655,6 +1615,43 @@ static void cleanup(struct alctrz *self)
 }
 
 /**
+ *  imprisonment desc.
+ *
+ *  @param  [in]    self    Self context.
+ *  @return Returns zero on success.
+ *          On error, -1 is returned.
+ */
+static int imprisonment(struct alctrz *self)
+{
+    pid_t pid = fork();
+    if (pid < 0) {
+        ERROR("fork: %s", strerror(errno));
+        return -1;
+    } else if (pid > 0) {
+        /* TODO: jail が完成するのを待ったほうが良い. */
+        return 0;
+    }
+
+#if 1
+    int null_fd = open("/dev/null", O_RDWR);
+    if ((dup2(null_fd, STDIN_FILENO) != STDIN_FILENO)
+        || (dup2(null_fd, STDOUT_FILENO) != STDOUT_FILENO)
+        || (dup2(null_fd, STDERR_FILENO) != STDERR_FILENO)) {
+
+        return -1;
+    }
+    close(null_fd);
+#endif
+
+    int status = alctrz(self);
+    /* cleanup() の呼び出しは親のみ. */
+    json_decref(self->jail.env);
+    free(self);
+
+    exit(status);
+}
+
+/**
  *  スタートアップ.
  *
  *  @param  [in]    argc    引数の数.
@@ -1664,74 +1661,59 @@ static void cleanup(struct alctrz *self)
  */
 int main(int argc, char **argv)
 {
-    struct alctrz *self = malloc(sizeof(*self));
     int ret;
+
+    struct alctrz *self = malloc(sizeof(*self));
+    if (self == NULL) {
+        ERROR("Internal error: %s", strerror(errno));
+        exit(1);
+    }
 
     *self = ALCTRZ_INITIALIZER;
     ret = parse_arguments(self, argc, argv);
     if (ret != 0) {
-        return 1;
+        print_usage(argv[0]);
+        exit(1);
     }
     if (self->show_help) {
         print_usage(argv[0]);
-        return 0;
+        exit(0);
     }
     if (self->show_version) {
         print_version();
-        return 0;
+        exit(0);
     }
 
     ret = create_stdio_for_prisoner(self);
     if (ret != 0) {
-        return 1;
+        /* FIXME: リソース解放漏れ？ */
+        exit(1);
     }
     tcgetattr(STDIN_FILENO, &saved_term);
     ioctl(STDIN_FILENO, TIOCGWINSZ, &winsz);
 
     if (!self->do_attach) {
-        ret = fork_daemon(
-            lambda(void, (void) {
-                DEBUG("fork_daemon: %s", strerror(errno));
-            }),
-            lambda(int, (void) {
-                int status = alctrz(self);
-                cleanup(self);
-                json_decref(self->jail.env);
-                free(self);
-                return status;
-            }),
-            lambda(int, (pid_t child_pid) {
-                set_blocking(STDIN_FILENO, false);
-
-                struct termios term = saved_term;
-                cfmakeraw(&term);
-                term.c_cc[VMIN]  = 1;
-                term.c_cc[VTIME] = 0;
-                tcsetattr(STDIN_FILENO, TCSAFLUSH, &term);
-
-                int status = visitation(self);
-
-                tcsetattr(STDIN_FILENO, TCSANOW, &saved_term);
-                set_blocking(STDIN_FILENO, true);
-
-                return status;
-            })
-        );
-    } else {
-        set_blocking(STDIN_FILENO, false);
-
-        struct termios term = saved_term;
-        cfmakeraw(&term);
-        term.c_cc[VMIN]  = 1;
-        term.c_cc[VTIME] = 0;
-        tcsetattr(STDIN_FILENO, TCSAFLUSH, &term);
-
-        ret = visitation(self);
-
-        tcsetattr(STDIN_FILENO, TCSANOW, &saved_term);
-        set_blocking(STDIN_FILENO, true);
+        ret = imprisonment(self);
+        if (ret != 0) {
+            /* FIXME: リソース解放漏れ？ */
+            exit(1);
+        }
     }
 
+    set_blocking(STDIN_FILENO, false);
+
+    struct termios term = saved_term;
+    cfmakeraw(&term);
+    term.c_cc[VMIN]  = 1;
+    term.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &term);
+
+    ret = visitation(self);
+
+    tcsetattr(STDIN_FILENO, TCSANOW, &saved_term);
+    set_blocking(STDIN_FILENO, true);
+
+    cleanup(self);
     json_decref(self->jail.env);
     free(self);
 

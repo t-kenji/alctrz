@@ -4,7 +4,7 @@ Alcatraz (Chroot jail provider)
 Introduction
 ------------
 
-Alcatraz is Chroot jail provider.
+Alcatraz is customizable chroot jail provider.
 
 Dependencies
 ------------

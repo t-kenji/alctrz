@@ -46,7 +46,7 @@ cppcheck:
 	@make -C src cppcheck
 
 install: build
-	install -m 0755 ./src/$(NAME) $(DESTDIR:/=)/root/
+	install -m 0755 ./src/$(NAME) $(DESTDIR:/=)/sbin/
 
 install-config:
 	install -m 0644 conf/env.json $(DESTDIR:/=)/etc/

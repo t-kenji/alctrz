@@ -1,11 +1,11 @@
-/** @file   collections.c
- *  @brief  コレクションに関する機能を提供する.
+/** @file       collections.c
+ *  @brief      コレクションに関する機能を提供する.
  *
  *  コレクション (リスト, スタック, キュー, ツリー) を提供する.
  *
- *  @author t-kenji <protect.2501@gmail.com>
- *  @date   2018-03-18 新規作成.
- *  @copyright  Copyright (c) 2018 t-kenji
+ *  @author     t-kenji <protect.2501@gmail.com>
+ *  @date       2018-03-18 新規作成.
+ *  @copyright  Copyright © 2018 t-kenji
  *
  *  This code is licensed under the MIT License.
  */
